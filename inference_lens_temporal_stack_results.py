@@ -79,6 +79,20 @@ def natural_key(path):
     return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', name)]
 
 
+def timestamp_key(path):
+    """Sort by timestamp encoded in file name.
+
+    Current data names look like "56_16514936054.jpg"; the last numeric group is
+    treated as the timestamp. Fallback to natural_key for non-standard names.
+    """
+    import re
+    stem = os.path.splitext(os.path.basename(path))[0]
+    nums = re.findall(r'\d+', stem)
+    if nums:
+        return (int(nums[-1]), natural_key(path))
+    return (0, natural_key(path))
+
+
 def get_input_paths(input_path, input_txt=None):
     if input_txt is not None:
         return read_paths_from_txt(input_txt)
@@ -89,7 +103,7 @@ def get_input_paths(input_path, input_txt=None):
     return paths, [None] * len(paths)
 
 
-def list_images_in_same_dir(img_path):
+def list_images_in_same_dir(img_path, sort_by_timestamp=True):
     img_dir = os.path.dirname(os.path.abspath(img_path))
     if not os.path.isdir(img_dir):
         return []
@@ -98,24 +112,74 @@ def list_images_in_same_dir(img_path):
         for name in os.listdir(img_dir)
         if is_image_file(name) and os.path.isfile(os.path.join(img_dir, name))
     ]
-    return sorted(paths, key=natural_key)
+    return sorted(paths, key=timestamp_key if sort_by_timestamp else natural_key)
 
 
-def build_seed_context_paths(seed_paths, window, include_seed=True):
+def sample_even_span_paths(paths, sample_count):
+    """Sample M images with maximum temporal span and near-even intervals."""
+    if not paths:
+        return []
+    sample_count = int(sample_count)
+    if sample_count <= 0 or sample_count >= len(paths):
+        return list(paths)
+    indices = np.linspace(0, len(paths) - 1, sample_count)
+    indices = np.rint(indices).astype(np.int64)
+    # Keep order while removing duplicates caused by rounding. Then refill from
+    # the largest remaining gaps if needed.
+    picked = []
+    seen = set()
+    for idx in indices:
+        idx = int(max(0, min(len(paths) - 1, idx)))
+        if idx not in seen:
+            picked.append(idx)
+            seen.add(idx)
+    while len(picked) < sample_count:
+        best_idx, best_dist = None, -1
+        for idx in range(len(paths)):
+            if idx in seen:
+                continue
+            dist = min(abs(idx - p) for p in picked)
+            if dist > best_dist:
+                best_idx, best_dist = idx, dist
+        picked.append(best_idx)
+        seen.add(best_idx)
+    return [paths[i] for i in sorted(picked)]
+
+
+def build_seed_context_paths(seed_paths, window, include_seed=True, sequence_mode='even_span', sample_count=7):
     seed_context_paths, all_paths, missing = [], set(), []
     for seed_path in seed_paths:
         seed_abs = os.path.abspath(seed_path)
-        dir_images = list_images_in_same_dir(seed_abs)
+        dir_images = list_images_in_same_dir(seed_abs, sort_by_timestamp=True)
         abs_to_path = {os.path.abspath(p): p for p in dir_images}
         if seed_abs not in abs_to_path:
             missing.append(seed_path)
             seed_context_paths.append([])
             continue
         seed_real = abs_to_path[seed_abs]
-        idx = dir_images.index(seed_real)
-        start = max(0, idx - window)
-        end = min(len(dir_images), idx + window + 1)
-        ctx = dir_images[start:end]
+        sequence_mode = (sequence_mode or 'even_span').lower()
+        if sequence_mode == 'even_span':
+            ctx = sample_even_span_paths(dir_images, sample_count)
+        elif sequence_mode == 'previous_next':
+            idx = dir_images.index(seed_real)
+            start = max(0, idx - window)
+            end = min(len(dir_images), idx + window + 1)
+            ctx = dir_images[start:end]
+        else:
+            raise ValueError(f'Unsupported sequence_mode: {sequence_mode}')
+        if include_seed and seed_real not in ctx:
+            # Keep seed in the visualization sequence when even sampling misses it.
+            # Replace the temporally nearest sampled item so M remains unchanged.
+            if sample_count > 0 and len(ctx) >= sample_count:
+                seed_idx = dir_images.index(seed_real)
+                replace_pos = min(
+                    range(len(ctx)),
+                    key=lambda i: abs(dir_images.index(ctx[i]) - seed_idx),
+                )
+                ctx[replace_pos] = seed_real
+                ctx = sorted(set(ctx), key=timestamp_key)
+            else:
+                ctx = sorted(ctx + [seed_real], key=timestamp_key)
         if not include_seed:
             ctx = [p for p in ctx if os.path.abspath(p) != seed_abs]
         seed_context_paths.append(ctx)
@@ -390,7 +454,9 @@ def main():
     parser.add_argument('--save_txt_dir', type=str, default=None, help='directory to save txt results and stack visualizations.')
     parser.add_argument('--save_file', type=str, default=None, help='optional CSV output path.')
     parser.add_argument('--no_vis', action='store_true', help='disable visualization saving. Default saves when --save_txt_dir is set.')
-    parser.add_argument('--window', type=int, default=3, help='use previous/next N frames plus seed for stacking.')
+    parser.add_argument('--sequence_mode', type=str, default='even_span', choices=['even_span', 'previous_next'], help='how to build temporal sequence. Default even_span samples M frames from the whole seed directory with maximum time span and near-even intervals.')
+    parser.add_argument('--sample_count', type=int, default=7, help='M: total frame count sampled from the seed directory when --sequence_mode even_span is used.')
+    parser.add_argument('--window', type=int, default=3, help='use previous/next N frames plus seed when --sequence_mode previous_next is used.')
     parser.add_argument('--resize_width', type=int, default=640, help='resize width; <=0 disables.')
     parser.add_argument('--noise_blur_ksize', type=int, default=5, help='small blur kernel for high-frequency noise residual.')
     parser.add_argument('--noise_top_percent', type=float, default=5.0, help='top percentage used for noise/std summary.')
@@ -413,8 +479,14 @@ def main():
         raise ValueError('No input images found.')
     resize_width = args.resize_width if args.resize_width > 0 else None
 
-    seed_context_paths, all_load_paths = build_seed_context_paths(input_paths, args.window, include_seed=True)
-    print('Loading seed images and same-directory previous/next frames...')
+    seed_context_paths, all_load_paths = build_seed_context_paths(
+        input_paths,
+        args.window,
+        include_seed=True,
+        sequence_mode=args.sequence_mode,
+        sample_count=args.sample_count,
+    )
+    print('Loading seed images and same-directory temporal sequence frames...')
     print(f'Seed images: {len(input_paths)}')
     print(f'Images to load including stack frames: {len(all_load_paths)}')
     cache = {}
@@ -435,9 +507,12 @@ def main():
         txt_f.write('  stack: save seed, temporal mean, temporal median, temporal std map.\n')
         txt_f.write('  noise: average high-frequency residual over the N-window stack.\n')
         txt_f.write('  temporal_decay_dilation: adjacent-frame close pixels are dilated, then accumulated by multiplicative darkening.\n')
-        for k in ['window', 'resize_width', 'noise_blur_ksize', 'noise_top_percent', 'close_thresh', 'dilate_kernel', 'decay_rate', 'black_threshold', 'normal_scene']:
+        for k in ['sequence_mode', 'sample_count', 'window', 'resize_width', 'noise_blur_ksize', 'noise_top_percent', 'close_thresh', 'dilate_kernel', 'decay_rate', 'black_threshold', 'normal_scene']:
             txt_f.write(f'{k}: {getattr(args, k)}\n')
-        txt_f.write('seed_expand_mode: same_directory_previous_next_existing_files_include_seed\n')
+        if args.sequence_mode == 'even_span':
+            txt_f.write('seed_expand_mode: same_directory_all_images_timestamp_sort_even_span_sample_include_seed\n')
+        else:
+            txt_f.write('seed_expand_mode: same_directory_previous_next_existing_files_include_seed\n')
         txt_f.write(f'seed_count: {len(input_paths)}\nloaded_image_count: {len(all_load_paths)}\nvis_dir: {vis_dir}\n')
         txt_f.write(f'time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')
         txt_f.write('scene\timage\t' + '\t'.join(RESULT_COLUMNS) + '\ttime\tvisualization\n')
