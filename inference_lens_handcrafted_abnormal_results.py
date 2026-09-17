@@ -231,7 +231,48 @@ def calculate_handcrafted_metrics(frames, args):
     }
 
 
-def save_visualization(img_path, seed_img, result, out_dir, index, scene, alpha=0.55):
+def make_prior_judgment(result, args):
+    specs = [
+        ('noise_score', 'noise', float(args.prior_noise_threshold)),
+        ('black_occlusion_score', 'occ', float(args.prior_occlusion_threshold)),
+        ('dust_score', 'dust', float(args.prior_dust_threshold)),
+        ('hair_score', 'hair', float(args.prior_hair_threshold)),
+    ]
+    hits = []
+    vals = {}
+    for key, name, th in specs:
+        try:
+            score = float(result.get(key, float('nan')))
+        except Exception:
+            score = float('nan')
+        vals[name] = score
+        if not math.isnan(score) and score > th:
+            hits.append(f'{name}:{format_float(score)}>{format_float(th)}')
+    valid = [(v, k) for k, v in vals.items() if not math.isnan(v)]
+    top_text = 'top=unknown'
+    if valid:
+        top_score, top_name = max(valid, key=lambda x: x[0])
+        top_text = f'top={top_name}:{format_float(top_score)}'
+    pred = 'ABNORMAL' if hits else 'NORMAL'
+    return pred, hits, vals, top_text
+
+
+def make_visual_judgment_lines(result, args):
+    pred, hits, vals, top_text = make_prior_judgment(result, args)
+    hit_text = ','.join(h.split(':', 1)[0] for h in hits) if hits else 'none'
+    return [
+        f'prior_judge={pred} hits={hit_text} {top_text}',
+        'scores: ' + ' '.join(f'{k}={format_float(v)}' for k, v in vals.items()),
+        'thr: n>{} o>{} d>{} h>{}'.format(
+            format_float(args.prior_noise_threshold),
+            format_float(args.prior_occlusion_threshold),
+            format_float(args.prior_dust_threshold),
+            format_float(args.prior_hair_threshold),
+        ),
+    ]
+
+
+def save_visualization(img_path, seed_img, result, out_dir, index, scene, args, alpha=0.55):
     base = np.clip(seed_img, 0, 255).astype(np.uint8)
     panels = [
         base.copy(),
@@ -243,8 +284,9 @@ def save_visualization(img_path, seed_img, result, out_dir, index, scene, alpha=
         tile.overlay(base, result['hair_heat'], alpha),
         tile.colorize_01(np.maximum(result['dust_blob_heat'], result['hair_line_heat'])),
     ]
+    seed_name = os.path.basename(img_path)
     labels = [
-        f'seed scene={scene or "none"}',
+        f'seed={seed_name} scene={scene or "none"}',
         f'noise={format_float(result["noise_score"])}',
         f'occlusion={format_float(result["black_occlusion_score"])}',
         f'temporal_static={format_float(result["temporal_static_mean"])}',
@@ -254,9 +296,13 @@ def save_visualization(img_path, seed_img, result, out_dir, index, scene, alpha=
         'shape clues: dust_blob OR hair_line',
     ]
     labs = []
-    for p, label in zip(panels, labels):
+    judgment_lines = make_visual_judgment_lines(result, args)
+    for idx, (p, label) in enumerate(zip(panels, labels)):
         p = p.copy()
-        tile.put_label(p, label)
+        tile.put_label(p, label, 26)
+        if idx == 0:
+            for line_i, text in enumerate(judgment_lines):
+                tile.put_label(p, text, 54 + 28 * line_i)
         labs.append(p)
     canvas = np.concatenate([
         np.concatenate(labs[:4], axis=1),
@@ -342,6 +388,13 @@ def main():
     parser.add_argument('--hair_line_width', type=int, default=3)
     parser.add_argument('--semitransparent_luma_sigma', type=float, default=70.0)
 
+    # Prior thresholds learned from 20260917_144633.lens_handcrafted_abnormal.txt.
+    # Final abnormal decision: noise OR occlusion OR dust OR hair score exceeds its threshold.
+    parser.add_argument('--prior_noise_threshold', type=float, default=69.0000)
+    parser.add_argument('--prior_occlusion_threshold', type=float, default=70.0000)
+    parser.add_argument('--prior_dust_threshold', type=float, default=0.1500)
+    parser.add_argument('--prior_hair_threshold', type=float, default=1.7170)
+
     parser.add_argument('--normal_scene', default='normal')
     parser.add_argument('--noise_positive_scenes', default='noise,noisy,low_light,dark,weak_light,噪声,暗光,弱光')
     parser.add_argument('--black_positive_scenes', default='black,occlusion,block,cover,install,安装遮挡,遮挡,黑屏')
@@ -366,7 +419,7 @@ def main():
     vis_dir = None if args.no_vis else build_vis_save_dir(save_txt_path)
     txt_f = open(save_txt_path, 'w', encoding='utf-8')
     txt_f.write(f'metric_name: {args.metric_name}\nmetric_mode: NR\nscore_direction: larger_means_more_abnormal\n')
-    txt_f.write('method: independent handcrafted branches. noise/occlusion reuse previous stable branches; dust=temporal_static*soft_blob*low_contrast*blur*anti_line; hair=temporal_static*line*coherence*elongated_contour*semi_transparent. Long overexposure is excluded from dust/hair temporal prior.\n')
+    txt_f.write('method: independent handcrafted branches. noise/occlusion reuse previous stable branches; dust=temporal_static*soft_blob*low_contrast*blur*anti_line; hair=temporal_static*line*coherence*elongated_contour*semi_transparent. Long overexposure is excluded from dust/hair temporal prior. Prior abnormal decision uses adjusted fixed thresholds from 20260917_145119.lens_handcrafted_abnormal.txt: noise>69.0000 OR occlusion>70.0000 OR dust>0.1500 OR hair>1.7170. Noise/occlusion are raised to reduce false alarms; dust is lowered to reduce misses.\n')
     for k in vars(args):
         txt_f.write(f'{k}: {getattr(args, k)}\n')
     txt_f.write(f'seed_count: {len(paths)}\nloaded_image_count: {len(load_paths)}\nauto_shifted_seed_count: {len(seed_adjustments)}\nweak_seed_count: {len(weak_seeds)}\ninvalid_seed_count: {len(invalid_seeds)}\nvis_dir: {vis_dir}\ntime: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')
@@ -385,7 +438,7 @@ def main():
         scene = scenes[i]
         frames = [cache[os.path.abspath(x)] for x in seqs[i]]
         res = calculate_handcrafted_metrics(frames, args)
-        vis = save_visualization(p, cache[os.path.abspath(p)], res, vis_dir, i, scene, args.heatmap_alpha) if vis_dir else ''
+        vis = save_visualization(p, cache[os.path.abspath(p)], res, vis_dir, i, scene, args, args.heatmap_alpha) if vis_dir else ''
         samples.append((scene, p, res))
         for m in SCORE_COLUMNS:
             update_scene_stat(stats[m], scene, float(res[m]), p)
