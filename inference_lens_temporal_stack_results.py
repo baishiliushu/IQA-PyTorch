@@ -80,19 +80,23 @@ def natural_key(path):
 
 
 def timestamp_key(path):
-    """Sort by timestamp encoded in file name.
+    """Sort by camera timestamp encoded in file name.
 
-    Current data names look like "56_16514936054.jpg"; the last numeric group is
-    treated as the timestamp. Fallback to natural_key for non-standard names.
+    Expected data names look like ``00_9803820953.jpg``: the numeric part
+    before ``_`` is minute, and the numeric part after ``_`` is the timestamp
+    inside that minute. Therefore the correct temporal key is
+    ``(minute, intra_minute_timestamp)``. For non-standard names, fall back to
+    all numeric groups and then natural_key.
     """
     import re
     stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r'^(\d+)_(\d+)$', stem)
+    if m:
+        return (0, int(m.group(1)), int(m.group(2)), natural_key(path))
     nums = re.findall(r'\d+', stem)
     if nums:
-        return (int(nums[-1]), natural_key(path))
-    return (0, natural_key(path))
-
-
+        return (1, tuple(int(x) for x in nums), natural_key(path))
+    return (2, natural_key(path))
 def get_input_paths(input_path, input_txt=None):
     if input_txt is not None:
         return read_paths_from_txt(input_txt)
@@ -280,29 +284,27 @@ def calculate_noise_from_stack(stack, noise_blur_ksize=5, noise_top_percent=5.0)
 
 
 def calculate_temporal_decay_black(stack, close_thresh=6.0, dilate_kernel=9, decay_rate=0.82, black_threshold=80):
-    """Temporal decay dilation.
+    """Temporal decay without dilation.
 
     For every adjacent pair, pixels whose RGB/BGR distance is within close_thresh
-    are treated as same-position stable candidates. Their dilated neighborhood
-    is multiplied by decay_rate; repeated hits become progressively darker.
+    are treated as same-position stable candidates. Stable pixels are multiplied
+    by decay_rate directly; repeated hits become progressively darker.
+
+    dilate_kernel is kept only for command-line compatibility and is not used.
     """
     if len(stack) < 2:
         h, w = stack[0].shape[:2]
-        return np.full((h, w), 255, dtype=np.uint8), np.zeros((h, w), dtype=np.float32), 0.0, 0.0
+        return np.full((h, w), 255, dtype=np.uint8), np.zeros((h, w), dtype=np.float32), 0.0, 0.0, 0.0
 
     h, w = stack[0].shape[:2]
     decay_img = np.full((h, w), 255.0, dtype=np.float32)
     hit_count = np.zeros((h, w), dtype=np.float32)
-    k = ensure_odd_kernel(dilate_kernel, 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     stable_total = 0.0
 
     for i in range(1, len(stack)):
         diff = np.abs(stack[i].astype(np.float32) - stack[i - 1].astype(np.float32)).mean(axis=2)
         stable = (diff <= close_thresh).astype(np.uint8)
         stable_total += float(stable.mean())
-        if k > 1:
-            stable = cv2.dilate(stable, kernel, iterations=1)
         mask = stable > 0
         decay_img[mask] *= float(decay_rate)
         hit_count[mask] += 1.0
@@ -368,8 +370,14 @@ def save_stack_visualization(img_path, seed_img, result, out_dir, index, scene, 
     decay_bgr = cv2.cvtColor(result['decay_img'], cv2.COLOR_GRAY2BGR)
     hit_color = colorize_01(result['hit_norm'])
 
-    # Overlay hit map on the mean image; repeated stable/dilated hits are expected to reveal lens-attached pollution.
-    hit_overlay = cv2.addWeighted(mean_img, 1.0 - alpha, hit_color, alpha, 0)
+    # Overlay hit map on the mean image; repeated stable hits are expected
+    # to reveal lens-attached pollution.  Keep zero-hit pixels unchanged: JET maps
+    # zero to blue, so blending the full heatmap would incorrectly tint the whole
+    # image and make non-stable regions look suspicious.
+    hit_overlay = mean_img.copy()
+    hit_mask = result['hit_norm'] > 0
+    blended_hit = cv2.addWeighted(mean_img, 1.0 - alpha, hit_color, alpha, 0)
+    hit_overlay[hit_mask] = blended_hit[hit_mask]
     panels = [base, mean_img, median_img, std_color, noise_color, decay_bgr, hit_overlay]
     labels = [
         'seed',
@@ -445,7 +453,7 @@ def scene_separability_msgs(scene_stats, metric_name, normal_scene='normal'):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Visualize temporal image stacking, noise, and temporal-decay dilation for lens pollution.')
+    parser = argparse.ArgumentParser(description='Visualize temporal image stacking, noise, and temporal-decay accumulation for lens pollution.')
     parser.add_argument('-t', '--target', type=str, default=None, help='input image/folder path.')
     parser.add_argument('--target_txt', type=str, default=None, help='txt file containing seed image paths and scene markers.')
     parser.add_argument('-m', '--metric_name', type=str, default='lens_temporal_stack', help='metric name used in logs/result file name.')
@@ -461,8 +469,8 @@ def main():
     parser.add_argument('--noise_blur_ksize', type=int, default=5, help='small blur kernel for high-frequency noise residual.')
     parser.add_argument('--noise_top_percent', type=float, default=5.0, help='top percentage used for noise/std summary.')
     parser.add_argument('--close_thresh', type=float, default=6.0, help='adjacent-frame RGB/BGR mean absolute difference threshold for stable pixels.')
-    parser.add_argument('--dilate_kernel', type=int, default=9, help='dilation kernel for stable pixels before temporal black decay.')
-    parser.add_argument('--decay_rate', type=float, default=0.82, help='stable dilated region is multiplied by this value each hit; smaller becomes black faster.')
+    parser.add_argument('--dilate_kernel', type=int, default=9, help='kept for compatibility; dilation is disabled and this argument is ignored.')
+    parser.add_argument('--decay_rate', type=float, default=0.82, help='stable region is multiplied by this value each hit; smaller becomes black faster.')
     parser.add_argument('--black_threshold', type=float, default=80.0, help='threshold to report black_pixel_ratio in decay image.')
     parser.add_argument('--heatmap_alpha', type=float, default=0.55, help='overlay alpha for stable-hit visualization.')
     parser.add_argument('--score_metric', type=str, default='stable_decay_score', choices=['noise_score', 'stable_decay_score', 'temporal_std_top_mean'], help='metric used for average/scene separability.')
@@ -506,7 +514,7 @@ def main():
         txt_f.write('method:\n')
         txt_f.write('  stack: save seed, temporal mean, temporal median, temporal std map.\n')
         txt_f.write('  noise: average high-frequency residual over the N-window stack.\n')
-        txt_f.write('  temporal_decay_dilation: adjacent-frame close pixels are dilated, then accumulated by multiplicative darkening.\n')
+        txt_f.write('  temporal_decay: adjacent-frame close pixels are accumulated by multiplicative darkening; dilation is disabled.\n')
         for k in ['sequence_mode', 'sample_count', 'window', 'resize_width', 'noise_blur_ksize', 'noise_top_percent', 'close_thresh', 'dilate_kernel', 'decay_rate', 'black_threshold', 'normal_scene']:
             txt_f.write(f'{k}: {getattr(args, k)}\n')
         if args.sequence_mode == 'even_span':

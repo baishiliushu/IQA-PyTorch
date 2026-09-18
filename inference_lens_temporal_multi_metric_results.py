@@ -19,7 +19,6 @@ SCORE_COLUMNS = [
     'black_occlusion_score',
     'dust_score',
     'hair_score',
-    'composite_score',
 ]
 RESULT_COLUMNS = SCORE_COLUMNS + [
     'noise_response',
@@ -92,14 +91,23 @@ def natural_key(path):
 
 
 def timestamp_key(path):
+    """Sort by camera timestamp encoded in file name.
+
+    Expected data names look like ``00_9803820953.jpg``: the numeric part
+    before ``_`` is minute, and the numeric part after ``_`` is the timestamp
+    inside that minute. Therefore the correct temporal key is
+    ``(minute, intra_minute_timestamp)``. For non-standard names, fall back to
+    all numeric groups and then natural_key.
+    """
     import re
     stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r'^(\d+)_(\d+)$', stem)
+    if m:
+        return (0, int(m.group(1)), int(m.group(2)), natural_key(path))
     nums = re.findall(r'\d+', stem)
     if nums:
-        return (int(nums[-1]), natural_key(path))
-    return (0, natural_key(path))
-
-
+        return (1, tuple(int(x) for x in nums), natural_key(path))
+    return (2, natural_key(path))
 def get_input_paths(input_path, input_txt=None):
     if input_txt is not None:
         return read_paths_from_txt(input_txt)
@@ -349,7 +357,11 @@ def calculate_noise_metric(frames, args):
         low = cv2.GaussianBlur(g, (k, k), 0)
         maps.append(np.abs(g - low))
     residual = np.mean(np.stack(maps, axis=0), axis=0).astype(np.float32)
-    dark_amp = 1.0 + 0.5 * np.exp(-grays[0] / 60.0)
+    # Low-light prior: when illumination is insufficient, sensor noise probability rises.
+    # Old behavior was noise_dark_weight=0.5, i.e. max dark amplification ~=1.5.
+    dark_weight = float(getattr(args, 'noise_dark_weight', 0.5))
+    dark_scale = float(getattr(args, 'noise_dark_scale', 60.0))
+    dark_amp = 1.0 + dark_weight * np.exp(-grays[0] / max(dark_scale, 1e-6))
     noise_map = np.clip(residual * dark_amp / 20.0, 0.0, 1.0).astype(np.float32)
     unit_noise, heat = aggregate_map_to_units(noise_map, args.unit_width, args.unit_height)
     score, kcnt = top_percent_mean(unit_noise, max(args.top_unit_percent, 5.0), largest=True)
@@ -486,13 +498,8 @@ def calculate_all_metrics(metric_stacks, args):
     black = calculate_black_occlusion_metric(metric_stacks['black'], args)
     dust = calculate_dust_metric(metric_stacks['dust'], args)
     hair = calculate_hair_metric(metric_stacks['hair'], args)
-    weights = np.asarray([float(x) for x in args.composite_weights.split(',')], dtype=np.float32)
-    if weights.size != 4 or float(weights.sum()) <= 1e-6:
-        weights = np.ones(4, dtype=np.float32)
-    scores = np.asarray([noise['noise_score'], black['black_occlusion_score'], dust['dust_score'], hair['hair_score']], dtype=np.float32)
     result = {}
     result.update(noise); result.update(black); result.update(dust); result.update(hair)
-    result['composite_score'] = float(np.sum(scores * weights) / np.sum(weights))
     result['valid_noise_frames'] = len(metric_stacks['noise'])
     result['valid_black_frames'] = len(metric_stacks['black'])
     result['valid_dust_frames'] = len(metric_stacks['dust'])
@@ -542,7 +549,7 @@ def save_visualization(img_path, seed_img, result, out_dir, index, scene, alpha=
     for p, label in zip(panels, labels):
         p = p.copy(); put_label(p, label); labeled.append(p)
     blank = np.zeros_like(base)
-    put_label(blank, f'composite={format_float(result["composite_score"])}', 26)
+    put_label(blank, 'per-branch abnormal scores, no composite score', 26)
     put_label(blank, f'n/b/d/h frames={result["valid_noise_frames"]}/{result["valid_black_frames"]}/{result["valid_dust_frames"]}/{result["valid_hair_frames"]}', 54)
     put_label(blank, f'dust: stable={format_float(result["dust_temporal_stable"])} spot={format_float(result["dust_spot_response"])} freq={format_float(result["dust_freq_response"])}', 82)
     put_label(blank, f'hair: stable={format_float(result["hair_temporal_stable"])} line={format_float(result["hair_line_response"])} freq={format_float(result["hair_freq_response"])}', 110)
@@ -705,17 +712,100 @@ def independent_problem_confusion_matrix_msgs(sample_scores_by_metric, args):
             valid.append((is_positive, float(score), scene, path))
         msgs.extend(format_confusion_matrix_msgs(metric_name, positive_name, valid))
 
-    # composite_score 不是某一种独立问题，只作为“任意异常 vs normal”的整体参考。
-    composite_samples = sample_scores_by_metric.get('composite_score', [])
-    composite_valid = []
-    for scene, path, score in composite_samples:
-        if not scene or math.isnan(float(score)):
-            continue
-        is_any_problem = scene.lower() != args.normal_scene.lower()
-        composite_valid.append((is_any_problem, float(score), scene, path))
-    msgs.extend(format_confusion_matrix_msgs('composite_score', 'any_problem', composite_valid))
     return msgs
 
+
+
+def any_branch_alarm_confusion_matrix_msgs(sample_results, args):
+    """Normal-vs-abnormal alarm by OR-ing independent defect branches.
+
+    No composite score is used. Each defect metric gets its own threshold from
+    its corresponding independent binary problem, then final alarm is:
+        noise_hit OR black_hit OR dust_hit OR hair_hit
+    """
+    defect_specs = [
+        ('noise_score', 'noise', split_aliases(args.noise_positive_scenes)),
+        ('black_occlusion_score', 'black_occlusion', split_aliases(args.black_positive_scenes)),
+        ('dust_score', 'dust', split_aliases(args.dust_positive_scenes)),
+        ('hair_score', 'hair', split_aliases(args.hair_positive_scenes)),
+    ]
+    msgs = [
+        'Any-branch abnormal alarm matrix; no composite score is used.',
+        'Rule: alarm = noise_hit OR black_occlusion_hit OR dust_hit OR hair_hit.',
+    ]
+    thresholds = {}
+    for metric_name, positive_name, aliases in defect_specs:
+        valid = []
+        for scene, path, res in sample_results:
+            if not scene:
+                continue
+            score = float(res.get(metric_name, float('nan')))
+            if math.isnan(score):
+                continue
+            valid.append((scene_matches_aliases(scene, aliases), score, scene, path))
+        if valid and any(x[0] for x in valid) and any(not x[0] for x in valid):
+            _, th, tp, tn, fp, fn, acc, balanced_acc = build_best_binary_confusion(valid)
+            thresholds[metric_name] = th
+            msgs.append(
+                f'  branch_threshold[{metric_name}/{positive_name}]={format_float(th)} '
+                f'(branch_balanced_acc={format_float(balanced_acc)}, branch_acc={format_float(acc)})'
+            )
+        else:
+            thresholds[metric_name] = float('inf')
+            msgs.append(f'  branch_threshold[{metric_name}/{positive_name}]=inf (insufficient labels)')
+
+    tp = tn = fp = fn = 0
+    hit_counter = {name: 0 for _, name, _ in defect_specs}
+    false_alarm_paths = []
+    miss_paths = []
+    for scene, path, res in sample_results:
+        if not scene:
+            continue
+        true_alarm = scene.lower() != args.normal_scene.lower()
+        hits = []
+        for metric_name, positive_name, _ in defect_specs:
+            score = float(res.get(metric_name, float('nan')))
+            th = thresholds.get(metric_name, float('inf'))
+            if not math.isnan(score) and not math.isinf(th) and score > th:
+                hits.append(positive_name)
+                hit_counter[positive_name] += 1
+        pred_alarm = bool(hits)
+        if true_alarm and pred_alarm:
+            tp += 1
+        elif true_alarm and not pred_alarm:
+            fn += 1
+            miss_paths.append((scene, path))
+        elif (not true_alarm) and pred_alarm:
+            fp += 1
+            false_alarm_paths.append((scene, path, ','.join(hits)))
+        else:
+            tn += 1
+
+    total = tp + tn + fp + fn
+    acc = (tp + tn) / float(total) if total else 0.0
+    normal_recall = tn / float(tn + fp) if (tn + fp) else 0.0
+    abnormal_recall = tp / float(tp + fn) if (tp + fn) else 0.0
+    precision_alarm = tp / float(tp + fp) if (tp + fp) else 0.0
+    f1_alarm = 2.0 * precision_alarm * abnormal_recall / float(precision_alarm + abnormal_recall) if (precision_alarm + abnormal_recall) else 0.0
+    msgs.append('  confusion_matrix:')
+    msgs.append('                         pred_normal  pred_alarm')
+    msgs.append(f'    true_normal              {tn:6d}      {fp:6d}')
+    msgs.append(f'    true_abnormal            {fn:6d}      {tp:6d}')
+    msgs.append(
+        f'  total={total}, accuracy={format_float(acc)}, normal_recall={format_float(normal_recall)}, '
+        f'abnormal_recall={format_float(abnormal_recall)}, precision_alarm={format_float(precision_alarm)}, '
+        f'f1_alarm={format_float(f1_alarm)}'
+    )
+    msgs.append('  branch_hit_count: ' + ', '.join(f'{k}={v}' for k, v in hit_counter.items()))
+    if false_alarm_paths:
+        msgs.append('  false_alarm_examples:')
+        for scene, path, hits in false_alarm_paths[:10]:
+            msgs.append(f'    [{scene}] hits={hits}: {path}')
+    if miss_paths:
+        msgs.append('  miss_examples:')
+        for scene, path in miss_paths[:10]:
+            msgs.append(f'    [{scene}] {path}')
+    return msgs
 
 def scene_to_multiclass_label(scene, args):
     if not scene:
@@ -862,6 +952,8 @@ def main():
     parser.add_argument('--stable_variation_scale', type=float, default=3.0, help='black metric exp(-variation/scale).')
     parser.add_argument('--black_luma_scale', type=float, default=35.0, help='black occlusion luminance scale.')
     parser.add_argument('--noise_blur_ksize', type=int, default=5, help='small blur kernel for noise residual.')
+    parser.add_argument('--noise_dark_weight', type=float, default=0.5, help='low-light amplification weight for noise; old/default max amplification is 1+0.5.')
+    parser.add_argument('--noise_dark_scale', type=float, default=60.0, help='luma decay scale for low-light noise amplification.')
     parser.add_argument('--edge_low', type=float, default=40.0, help='Canny low threshold.')
     parser.add_argument('--edge_high', type=float, default=120.0, help='Canny high threshold.')
     parser.add_argument('--dust_stable_scale', type=float, default=8.0, help='dust temporal std stability scale; larger is more tolerant.')
@@ -876,8 +968,7 @@ def main():
     parser.add_argument('--hair_line_width', type=int, default=3, help='elongated morphology kernel width.')
     parser.add_argument('--hair_fft_inner', type=float, default=0.015, help='inner radius ratio of FFT band-pass for hair.')
     parser.add_argument('--hair_fft_outer', type=float, default=0.18, help='outer radius ratio of FFT band-pass for hair.')
-    parser.add_argument('--composite_weights', type=str, default='1,1,1,1', help='weights for noise,black,dust,hair composite score.')
-    parser.add_argument('--score_metric', type=str, default='composite_score', choices=SCORE_COLUMNS, help='metric used for progress/overall average.')
+    parser.add_argument('--score_metric', type=str, default='dust_score', choices=SCORE_COLUMNS, help='metric used only for progress/overall average; final alarm uses per-branch OR logic.')
     parser.add_argument('--normal_scene', type=str, default='normal', help='scene name used as normal class.')
     parser.add_argument('--noise_positive_scenes', type=str, default='noise,noisy,low_light,dark,weak_light,噪声,暗光,弱光', help='comma-separated scene-name aliases treated as positive for noise_score.')
     parser.add_argument('--black_positive_scenes', type=str, default='black,occlusion,block,cover,install,安装遮挡,遮挡,黑屏', help='comma-separated scene-name aliases treated as positive for black_occlusion_score.')
@@ -962,7 +1053,7 @@ def main():
         prefix = f'[{scene}] ' if scene else ''
         pbar.update(1)
         pbar.set_description(f'{prefix}{args.metric_name}/{args.score_metric} of {os.path.basename(img_path)}: {format_float(score)}')
-        pbar.write(f'{prefix}{args.metric_name} {os.path.basename(img_path)}: composite={format_float(result["composite_score"])} noise={format_float(result["noise_score"])} black={format_float(result["black_occlusion_score"])} dust={format_float(result["dust_score"])} hair={format_float(result["hair_score"])} Time: {elapsed}s')
+        pbar.write(f'{prefix}{args.metric_name} {os.path.basename(img_path)}: noise={format_float(result["noise_score"])} black={format_float(result["black_occlusion_score"])} dust={format_float(result["dust_score"])} hair={format_float(result["hair_score"])} Time: {elapsed}s')
 
         row = [scene or '', img_path] + values + [elapsed, vis_path]
         if writer is not None:
@@ -991,6 +1082,7 @@ def main():
     sep_msgs = scene_separability_msgs(scene_stats_by_metric, args.normal_scene) if scene_stats_by_metric else []
     for m in sep_msgs:
         print(m)
+    alarm_msgs = any_branch_alarm_confusion_matrix_msgs(sample_results, args) if sample_results else []
     cm_msgs = multiclass_confusion_matrix_msgs(sample_results, args) if sample_results else []
     for m in cm_msgs:
         print(m)

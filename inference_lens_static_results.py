@@ -179,9 +179,15 @@ def build_seed_context_paths(seed_paths, window):
     return seed_context_paths, sorted(all_paths, key=natural_key)
 
 
-def imread_gray_resize(img_path, resize_width):
-    """Read image as grayscale float32 [0, 255], optionally resize by width."""
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+def imread_image_resize(img_path, resize_width, use_rgb=True):
+    """Read image as float32 [0, 255], optionally resize by width.
+
+    By default this keeps 3 color channels. OpenCV stores the data as BGR in
+    memory, but all three RGB/BGR channels are used consistently during temporal
+    difference calculation.
+    """
+    flag = cv2.IMREAD_COLOR if use_rgb else cv2.IMREAD_GRAYSCALE
+    img = cv2.imread(img_path, flag)
     if img is None:
         raise FileNotFoundError(f'Failed to read image: {img_path}')
 
@@ -192,12 +198,148 @@ def imread_gray_resize(img_path, resize_width):
     return img.astype(np.float32)
 
 
+def imread_gray_resize(img_path, resize_width):
+    """Backward-compatible wrapper. New logic uses imread_image_resize()."""
+    return imread_image_resize(img_path, resize_width, use_rgb=False)
+
+
+def ensure_odd_kernel(kernel_size, min_value=3):
+    """Normalize OpenCV kernel size to a positive odd integer."""
+    kernel_size = int(kernel_size)
+    if kernel_size < min_value:
+        kernel_size = min_value
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    return kernel_size
+
+
+def normalize_to_255(img):
+    """Normalize an image to float32 [0, 255]."""
+    img = img.astype(np.float32)
+    min_val = float(np.min(img))
+    max_val = float(np.max(img))
+    if max_val - min_val < 1e-6:
+        return np.zeros_like(img, dtype=np.float32)
+    return ((img - min_val) / (max_val - min_val) * 255.0).astype(np.float32)
+
+
+def preprocess_each_frame(
+    img,
+    method='gray',
+    blur_ksize=9,
+    clahe_clip_limit=2.0,
+    clahe_tile_grid_size=8,
+):
+    """Preprocess every frame before temporal difference calculation.
+
+    The temporal-static idea is sensitive to illumination/noise/background
+    texture. This function keeps all per-frame preprocessing in one place so
+    different assumptions can be validated by changing only --preprocess_method.
+
+    Supported methods:
+        gray/raw/none:
+            Use resized image directly. With default color input, RGB/BGR three
+            channels are kept and used in temporal difference calculation.
+        gaussian_blur:
+            Smooth noise before temporal difference. Useful when weak-light noise
+            causes unstable false negatives.
+        clahe:
+            Local contrast enhancement. Useful when dust/hair contrast is weak.
+        highpass:
+            Remove low-frequency illumination/background by subtracting local
+            Gaussian blur. Often better for lens hair/dust edge-like artifacts.
+        sobel:
+            Use gradient magnitude. Suppresses flat regions and highlights edges.
+        laplacian:
+            Use second-order edge response. More sensitive than sobel, also more
+            sensitive to noise.
+    """
+    method = (method or 'gray').lower()
+    img = np.clip(img, 0, 255).astype(np.float32)
+
+    if method in ('none', 'raw', 'gray'):
+        return img
+
+    blur_ksize = ensure_odd_kernel(blur_ksize)
+
+    if method == 'gaussian_blur':
+        return cv2.GaussianBlur(img, (blur_ksize, blur_ksize), 0).astype(np.float32)
+
+    if method == 'clahe':
+        tile_size = max(1, int(clahe_tile_grid_size))
+        clahe = cv2.createCLAHE(
+            clipLimit=float(clahe_clip_limit),
+            tileGridSize=(tile_size, tile_size),
+        )
+        if img.ndim == 2:
+            return clahe.apply(img.astype(np.uint8)).astype(np.float32)
+        lab = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_BGR2LAB)
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR).astype(np.float32)
+
+    if method == 'highpass':
+        low_freq = cv2.GaussianBlur(img, (blur_ksize, blur_ksize), 0)
+        highpass = img - low_freq + 128.0
+        return np.clip(highpass, 0, 255).astype(np.float32)
+
+    if method == 'sobel':
+        grad_x = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+        if img.ndim == 2:
+            magnitude = cv2.magnitude(grad_x, grad_y)
+        else:
+            magnitude = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+        return normalize_to_255(magnitude)
+
+    if method == 'laplacian':
+        lap = cv2.Laplacian(img, cv2.CV_32F, ksize=3)
+        return normalize_to_255(np.abs(lap))
+
+    raise ValueError(f'Unsupported preprocess method: {method}')
+
+
+def aggregate_map_to_units(value_map, unit_width=4, unit_height=3):
+    """Aggregate a per-pixel map to small super-pixel units.
+
+    This reduces pixel-level jitter while keeping the unit small enough to avoid
+    becoming coarse image blocks. Border units are kept with their actual size.
+    """
+    value_map = value_map.astype(np.float32)
+    height, width = value_map.shape[:2]
+    unit_width = max(1, int(unit_width))
+    unit_height = max(1, int(unit_height))
+
+    unit_rows = int(math.ceil(height / float(unit_height)))
+    unit_cols = int(math.ceil(width / float(unit_width)))
+    unit_map = np.zeros((unit_rows, unit_cols), dtype=np.float32)
+
+    for row in range(unit_rows):
+        y0 = row * unit_height
+        y1 = min(height, y0 + unit_height)
+        for col in range(unit_cols):
+            x0 = col * unit_width
+            x1 = min(width, x0 + unit_width)
+            unit_map[row, col] = float(value_map[y0:y1, x0:x1].mean())
+
+    expanded_map = cv2.resize(
+        unit_map,
+        (width, height),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(np.float32)
+    return unit_map, expanded_map
+
+
 def calculate_lens_static_score(
     img,
     neighbor_images,
     variation_thresh,
     min_area_ratio,
     morph_kernel,
+    unit_width=4,
+    unit_height=3,
+    top_unit_percent=1.0,
+    score_variation_scale=1.0,
+    temporal_reduce='max',
     return_maps=False,
 ):
     """Calculate lens-attached-object score for one frame.
@@ -208,8 +350,14 @@ def calculate_lens_static_score(
         dust/hair/occlusion stays fixed and has smaller temporal variation.
 
     Score:
-        largest connected low-variation component area ratio * 100.
-        Higher score means more suspicious lens contamination.
+        1. Calculate same-position temporal variation using RGB/BGR 3 channels.
+        2. Aggregate pixel variation into small super-pixel units, e.g. 4x3.
+        3. Focus on units with the smallest variation, but score directly from
+           their absolute variation value instead of clipped stable-degree.
+
+        This is not an area-ratio score. The default temporal_reduce=max also
+        requires a unit to stay stable against every neighbor frame, reducing
+        accidental 100 scores caused by one coincidentally similar frame.
     """
     start_time = time()
 
@@ -220,6 +368,12 @@ def calculate_lens_static_score(
             'stable_area_ratio': float('nan'),
             'largest_area_ratio': float('nan'),
             'mean_variation': float('nan'),
+            'mean_stable_degree': float('nan'),
+            'low_unit_variation': float('nan'),
+            'min_unit_variation': float('nan'),
+            'max_unit_stable_degree': float('nan'),
+            'top_unit_stable_degree': float('nan'),
+            'suspicious_unit_count': 0,
             'component_count': 0,
             'valid_neighbors': 0,
             'elapsed_time': elapsed_time,
@@ -228,15 +382,54 @@ def calculate_lens_static_score(
             result.update(
                 {
                     'variation_map': None,
+                    'unit_variation_map': None,
+                    'stable_degree_map': None,
+                    'unit_stable_degree_map': None,
                     'stable_mask': None,
                     'valid_component_mask': None,
                     'largest_component_mask': None,
+                    'top_unit_mask': None,
                 }
             )
         return result
 
-    diffs = [np.abs(img - neighbor_img) for neighbor_img in neighbor_images]
-    variation_map = np.median(np.stack(diffs, axis=0), axis=0)
+    diffs = []
+    for neighbor_img in neighbor_images:
+        diff = np.abs(img - neighbor_img)
+        if diff.ndim == 3:
+            # Use all three color channels. The result is one temporal
+            # variation value for each pixel location.
+            diff = diff.mean(axis=2)
+        diffs.append(diff)
+
+    diff_stack = np.stack(diffs, axis=0)
+    temporal_reduce = (temporal_reduce or 'max').lower()
+    if temporal_reduce == 'median':
+        pixel_variation_map = np.median(diff_stack, axis=0)
+    elif temporal_reduce == 'mean':
+        pixel_variation_map = np.mean(diff_stack, axis=0)
+    elif temporal_reduce == 'p75':
+        pixel_variation_map = np.percentile(diff_stack, 75, axis=0)
+    elif temporal_reduce == 'max':
+        pixel_variation_map = np.max(diff_stack, axis=0)
+    else:
+        raise ValueError(f'Unsupported temporal_reduce: {temporal_reduce}')
+
+    unit_variation_map, variation_map = aggregate_map_to_units(
+        pixel_variation_map,
+        unit_width=unit_width,
+        unit_height=unit_height,
+    )
+    unit_stable_degree_map = 1.0 - np.clip(
+        unit_variation_map / max(float(variation_thresh), 1e-6),
+        0.0,
+        1.0,
+    )
+    stable_degree_map = cv2.resize(
+        unit_stable_degree_map,
+        (pixel_variation_map.shape[1], pixel_variation_map.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(np.float32)
     stable_mask = (variation_map <= variation_thresh).astype(np.uint8)
 
     if morph_kernel and morph_kernel > 1:
@@ -269,7 +462,26 @@ def calculate_lens_static_score(
     stable_area = int(stable_mask.sum())
     stable_area_ratio = stable_area / image_area
     largest_area_ratio = largest_area / image_area
-    score = largest_area_ratio * 100.0
+    flat_unit_variation = unit_variation_map.reshape(-1)
+    top_unit_percent = max(0.0, min(100.0, float(top_unit_percent)))
+    top_k = max(1, int(math.ceil(flat_unit_variation.size * top_unit_percent / 100.0)))
+    low_unit_variations = np.sort(flat_unit_variation)[:top_k]
+    low_unit_variation = float(low_unit_variations.mean())
+    score_variation_scale = max(1e-6, float(score_variation_scale))
+    # Avoid the previous saturation problem:
+    # clipped stable degree makes all units below threshold almost equally high.
+    # Exponential mapping keeps sensitivity around near-zero variation.
+    score = float(100.0 * math.exp(-low_unit_variation / score_variation_scale))
+    top_unit_stable_degree = float(
+        np.mean(np.exp(-low_unit_variations / score_variation_scale))
+    )
+    top_unit_threshold = float(low_unit_variations.max())
+    top_unit_mask_small = (unit_variation_map <= top_unit_threshold).astype(np.uint8)
+    top_unit_mask = cv2.resize(
+        top_unit_mask_small,
+        (pixel_variation_map.shape[1], pixel_variation_map.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(np.uint8)
     elapsed_time = time() - start_time
 
     result = {
@@ -277,6 +489,12 @@ def calculate_lens_static_score(
         'stable_area_ratio': stable_area_ratio,
         'largest_area_ratio': largest_area_ratio,
         'mean_variation': float(variation_map.mean()),
+        'mean_stable_degree': float(stable_degree_map.mean()),
+        'low_unit_variation': low_unit_variation,
+        'min_unit_variation': float(unit_variation_map.min()),
+        'max_unit_stable_degree': float(unit_stable_degree_map.max()),
+        'top_unit_stable_degree': top_unit_stable_degree,
+        'suspicious_unit_count': top_k,
         'component_count': valid_component_count,
         'valid_neighbors': len(neighbor_images),
         'elapsed_time': elapsed_time,
@@ -286,9 +504,13 @@ def calculate_lens_static_score(
         result.update(
             {
                 'variation_map': variation_map,
+                'unit_variation_map': unit_variation_map,
+                'stable_degree_map': stable_degree_map,
+                'unit_stable_degree_map': unit_stable_degree_map,
                 'stable_mask': stable_mask,
                 'valid_component_mask': valid_component_mask,
                 'largest_component_mask': largest_component_mask,
+                'top_unit_mask': top_unit_mask,
             }
         )
     return result
@@ -327,21 +549,25 @@ def save_lens_static_heatmap(
     """Save one visualization image.
 
     Visualization convention:
-        - Red/yellow heatmap: low temporal variation, more suspicious.
+        - Red/yellow heatmap: stronger low-variation degree, more suspicious.
+        - Magenta contour: top suspicious super-pixel units used by score.
         - Green contour: valid low-variation connected components.
-        - Cyan contour: largest component that determines final score.
+        - Cyan contour: largest low-variation component, shown only as an
+          auxiliary shape cue. It no longer determines final score.
     """
     os.makedirs(heatmap_dir, exist_ok=True)
 
     if resized_gray.ndim == 2:
         base_bgr = cv2.cvtColor(np.clip(resized_gray, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
     else:
-        base_bgr = resized_gray.copy()
+        base_bgr = np.clip(resized_gray, 0, 255).astype(np.uint8)
 
     variation_map = result.get('variation_map')
+    stable_degree_map = result.get('stable_degree_map')
     stable_mask = result.get('stable_mask')
     valid_component_mask = result.get('valid_component_mask')
     largest_component_mask = result.get('largest_component_mask')
+    top_unit_mask = result.get('top_unit_mask')
 
     if variation_map is None or stable_mask is None:
         overlay = base_bgr
@@ -356,10 +582,12 @@ def save_lens_static_heatmap(
             cv2.LINE_AA,
         )
     else:
-        variation_thresh = max(1e-6, float(variation_thresh))
-        stable_strength = 1.0 - np.clip(variation_map / variation_thresh, 0.0, 1.0)
-        stable_strength = (stable_strength * stable_mask).astype(np.float32)
-        heat_u8 = np.clip(stable_strength * 255.0, 0, 255).astype(np.uint8)
+        if stable_degree_map is None:
+            variation_thresh = max(1e-6, float(variation_thresh))
+            stable_degree_map = 1.0 - np.clip(
+                variation_map / variation_thresh, 0.0, 1.0
+            )
+        heat_u8 = np.clip(stable_degree_map * 255.0, 0, 255).astype(np.uint8)
         heat_color = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
         overlay = base_bgr.copy()
         heat_mask = heat_u8 > 0
@@ -383,9 +611,18 @@ def save_lens_static_heatmap(
             )
             cv2.drawContours(overlay, contours, -1, (255, 255, 0), 2)
 
+        if top_unit_mask is not None and top_unit_mask.any():
+            contours, _ = cv2.findContours(
+                (top_unit_mask * 255).astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            cv2.drawContours(overlay, contours, -1, (255, 0, 255), 1)
+
     info_lines = [
         f'score={format_float(result["score"])}',
-        f'largest={format_float(result["largest_area_ratio"])}',
+        f'low_unit_var={format_float(result["low_unit_variation"])}',
+        f'min_unit_var={format_float(result["min_unit_variation"])}',
         f'mean_var={format_float(result["mean_variation"])}',
         f'neighbors={result["valid_neighbors"]}',
     ]
@@ -582,7 +819,38 @@ def main():
         '--variation_thresh',
         type=float,
         default=5.0,
-        help='low-variation threshold in grayscale value range [0, 255].',
+        help='low-variation threshold in RGB/BGR averaged value range [0, 255].',
+    )
+    parser.add_argument(
+        '--unit_width',
+        type=int,
+        default=4,
+        help='small super-pixel unit width for temporal variation aggregation.',
+    )
+    parser.add_argument(
+        '--unit_height',
+        type=int,
+        default=3,
+        help='small super-pixel unit height for temporal variation aggregation.',
+    )
+    parser.add_argument(
+        '--top_unit_percent',
+        type=float,
+        default=1.0,
+        help='score uses units with the lowest variation by this percentage.',
+    )
+    parser.add_argument(
+        '--score_variation_scale',
+        type=float,
+        default=1.0,
+        help='scale of exp(-low_unit_variation / scale) score mapping. Smaller value means only extremely stable units get high score.',
+    )
+    parser.add_argument(
+        '--temporal_reduce',
+        type=str,
+        default='max',
+        choices=['max', 'p75', 'median', 'mean'],
+        help='how to reduce temporal differences across neighbor frames. max is strict and helps avoid accidental 100 scores.',
     )
     parser.add_argument(
         '--min_area_ratio',
@@ -601,6 +869,40 @@ def main():
         type=int,
         default=640,
         help='resize image width for faster validation. Set <=0 to disable.',
+    )
+    parser.add_argument(
+        '--preprocess_method',
+        type=str,
+        default='gray',
+        choices=[
+            'gray',
+            'raw',
+            'none',
+            'gaussian_blur',
+            'clahe',
+            'highpass',
+            'sobel',
+            'laplacian',
+        ],
+        help='per-frame preprocessing before temporal difference.',
+    )
+    parser.add_argument(
+        '--preprocess_blur_ksize',
+        type=int,
+        default=9,
+        help='Gaussian kernel size used by gaussian_blur/highpass preprocessing.',
+    )
+    parser.add_argument(
+        '--clahe_clip_limit',
+        type=float,
+        default=2.0,
+        help='CLAHE clip limit when --preprocess_method clahe is used.',
+    )
+    parser.add_argument(
+        '--clahe_tile_grid_size',
+        type=int,
+        default=8,
+        help='CLAHE tile grid size when --preprocess_method clahe is used.',
     )
     parser.add_argument(
         '--normal_scene',
@@ -637,9 +939,19 @@ def main():
     print('Loading seed images and same-directory neighbor images...')
     print(f'Seed images: {len(input_paths)}')
     print(f'Images to load including neighbors: {len(all_load_paths)}')
-    image_cache = {}
+    raw_image_cache = {}
+    processed_image_cache = {}
     for img_path in tqdm(all_load_paths, total=len(all_load_paths), unit='image'):
-        image_cache[os.path.abspath(img_path)] = imread_gray_resize(img_path, resize_width)
+        img_abs_path = os.path.abspath(img_path)
+        raw_img = imread_image_resize(img_path, resize_width, use_rgb=True)
+        raw_image_cache[img_abs_path] = raw_img
+        processed_image_cache[img_abs_path] = preprocess_each_frame(
+            raw_img,
+            method=args.preprocess_method,
+            blur_ksize=args.preprocess_blur_ksize,
+            clahe_clip_limit=args.clahe_clip_limit,
+            clahe_tile_grid_size=args.clahe_tile_grid_size,
+        )
 
     if args.save_file:
         sf = open(args.save_file, 'w', newline='')
@@ -652,6 +964,12 @@ def main():
                 'stable_area_ratio',
                 'largest_area_ratio',
                 'mean_variation',
+                'mean_stable_degree',
+                'low_unit_variation',
+                'min_unit_variation',
+                'max_unit_stable_degree',
+                'top_unit_stable_degree',
+                'suspicious_unit_count',
                 'component_count',
                 'valid_neighbors',
                 'time',
@@ -678,20 +996,35 @@ def main():
         txt_f.write(f'lower_better: {lower_better}\n')
         txt_f.write(f'window: {args.window}\n')
         txt_f.write(f'variation_thresh: {format_float(args.variation_thresh)}\n')
+        txt_f.write(f'unit_width: {args.unit_width}\n')
+        txt_f.write(f'unit_height: {args.unit_height}\n')
+        txt_f.write(f'top_unit_percent: {format_float(args.top_unit_percent)}\n')
+        txt_f.write(f'score_variation_scale: {format_float(args.score_variation_scale)}\n')
+        txt_f.write(f'temporal_reduce: {args.temporal_reduce}\n')
         txt_f.write(f'min_area_ratio: {format_float(args.min_area_ratio)}\n')
         txt_f.write(f'morph_kernel: {args.morph_kernel}\n')
         txt_f.write(f'resize_width: {args.resize_width}\n')
+        txt_f.write(f'preprocess_method: {args.preprocess_method}\n')
+        txt_f.write(f'preprocess_blur_ksize: {args.preprocess_blur_ksize}\n')
+        txt_f.write(f'clahe_clip_limit: {format_float(args.clahe_clip_limit)}\n')
+        txt_f.write(f'clahe_tile_grid_size: {args.clahe_tile_grid_size}\n')
         txt_f.write('seed_expand_mode: same_directory_previous_next_existing_files\n')
         txt_f.write(f'seed_count: {len(input_paths)}\n')
         txt_f.write(f'loaded_image_count: {len(all_load_paths)}\n')
         txt_f.write(f'normal_scene: {args.normal_scene}\n')
+        txt_f.write('score_definition: 100_exp_minus_low_unit_variation_over_scale\n')
+        txt_f.write('color_channels: RGB/BGR_3_channels_used\n')
         txt_f.write(f'heatmap_dir: {heatmap_dir}\n')
         txt_f.write(f'heatmap_alpha: {format_float(args.heatmap_alpha)}\n')
         txt_f.write(f'time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
         txt_f.write('\n')
         txt_f.write(
             'scene\timage\tscore\tstable_area_ratio\tlargest_area_ratio\t'
-            'mean_variation\tcomponent_count\tvalid_neighbors\ttime\theatmap\n'
+            'mean_variation\tmean_stable_degree\tlow_unit_variation\t'
+            'min_unit_variation\t'
+            'max_unit_stable_degree\ttop_unit_stable_degree\t'
+            'suspicious_unit_count\tcomponent_count\t'
+            'valid_neighbors\ttime\theatmap\n'
         )
 
     avg_score = 0.0
@@ -714,14 +1047,21 @@ def main():
         img_name = os.path.basename(img_path)
         img_abs_path = os.path.abspath(img_path)
         context_paths = seed_context_paths[idx]
-        neighbor_images = [image_cache[os.path.abspath(path)] for path in context_paths]
+        neighbor_images = [
+            processed_image_cache[os.path.abspath(path)] for path in context_paths
+        ]
 
         result = calculate_lens_static_score(
-            image_cache[img_abs_path],
+            processed_image_cache[img_abs_path],
             neighbor_images,
             args.variation_thresh,
             args.min_area_ratio,
             args.morph_kernel,
+            unit_width=args.unit_width,
+            unit_height=args.unit_height,
+            top_unit_percent=args.top_unit_percent,
+            score_variation_scale=args.score_variation_scale,
+            temporal_reduce=args.temporal_reduce,
             return_maps=heatmap_dir is not None,
         )
 
@@ -729,7 +1069,7 @@ def main():
         if heatmap_dir is not None:
             heatmap_path = save_lens_static_heatmap(
                 img_path,
-                image_cache[img_abs_path],
+                raw_image_cache[img_abs_path],
                 result,
                 heatmap_dir,
                 idx,
@@ -757,13 +1097,20 @@ def main():
         stable_area_ratio_str = format_float(result['stable_area_ratio'])
         largest_area_ratio_str = format_float(result['largest_area_ratio'])
         mean_variation_str = format_float(result['mean_variation'])
+        mean_stable_degree_str = format_float(result['mean_stable_degree'])
+        low_unit_variation_str = format_float(result['low_unit_variation'])
+        min_unit_variation_str = format_float(result['min_unit_variation'])
+        max_unit_stable_degree_str = format_float(result['max_unit_stable_degree'])
+        top_unit_stable_degree_str = format_float(result['top_unit_stable_degree'])
         elapsed_time_str = format_float(result['elapsed_time'])
 
         pbar.update(1)
         pbar.set_description(f'{scene_prefix}{metric_name} of {img_name}: {score_str}')
         pbar.write(
             f'{scene_prefix}{metric_name} of {img_name}: {score_str}\t'
-            f'largest_area_ratio: {largest_area_ratio_str}\t'
+            f'low_unit_variation: {low_unit_variation_str}\t'
+            f'min_unit_variation: {min_unit_variation_str}\t'
+            f'largest_area_ratio(aux): {largest_area_ratio_str}\t'
             f'mean_variation: {mean_variation_str}\t'
             f'Time: {elapsed_time_str}s'
         )
@@ -777,6 +1124,12 @@ def main():
                     stable_area_ratio_str,
                     largest_area_ratio_str,
                     mean_variation_str,
+                    mean_stable_degree_str,
+                    low_unit_variation_str,
+                    min_unit_variation_str,
+                    max_unit_stable_degree_str,
+                    top_unit_stable_degree_str,
+                    result['suspicious_unit_count'],
                     result['component_count'],
                     result['valid_neighbors'],
                     elapsed_time_str,
@@ -788,7 +1141,11 @@ def main():
             txt_f.write(
                 f'{scene or ""}\t{img_path}\t{score_str}\t'
                 f'{stable_area_ratio_str}\t{largest_area_ratio_str}\t'
-                f'{mean_variation_str}\t{result["component_count"]}\t'
+                f'{mean_variation_str}\t{mean_stable_degree_str}\t'
+                f'{low_unit_variation_str}\t'
+                f'{min_unit_variation_str}\t{max_unit_stable_degree_str}\t'
+                f'{top_unit_stable_degree_str}\t{result["suspicious_unit_count"]}\t'
+                f'{result["component_count"]}\t'
                 f'{result["valid_neighbors"]}\t{elapsed_time_str}s\t'
                 f'{heatmap_path}\n'
             )

@@ -14,10 +14,11 @@ import inference_lens_tile_dirty_results as tile
 import inference_lens_temporal_multi_metric_results as multi
 import inference_lens_pixel_stability_observe as pix
 
-SCORE_COLUMNS = ['noise_score', 'black_occlusion_score', 'dust_score', 'hair_score']
+SCORE_COLUMNS = ['noise_score', 'black_occlusion_score', 'dust_score', 'dust_haze_score', 'hair_score']
 RESULT_COLUMNS = SCORE_COLUMNS + [
     'temporal_static_mean', 'overexp_excluded_ratio',
     'dust_blob_response', 'dust_low_contrast_response', 'dust_blur_response', 'dust_contour_response',
+    'dust_haze_response', 'dust_haze_halo_response',
     'hair_line_response', 'hair_coherence_response', 'hair_contour_response', 'hair_semitransparent_response',
     'unit_width', 'unit_height', 'valid_frames'
 ]
@@ -194,17 +195,37 @@ def calculate_handcrafted_metrics(frames, args):
     hair_shape = np.clip((0.48 * hair_line + 0.22 * coherence + 0.20 * hair_contour + 0.10 * mid), 0, 1)
 
     dust_map = np.clip(temporal_static * dust_shape * not_overexp, 0, 1)
+
+    # Haze-like semi-transparent dust: weak/veiling dust may not be pixel-stable
+    # after background motion, so do NOT multiply by strict temporal_static.
+    # It focuses on large soft low-contrast/blur regions around bright/sky/glare
+    # zones, while suppressing line-like structures and saturated overexposure.
+    bright_thr = max(float(args.haze_bright_threshold), float(np.percentile(gray, args.haze_bright_percentile)))
+    bright_mask = (gray >= bright_thr).astype(np.float32)
+    hk = tile.ensure_odd(args.haze_halo_ksize, 9)
+    halo = cv2.dilate(bright_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hk, hk)))
+    halo = cv2.GaussianBlur(halo, (0, 0), max(1.0, float(args.haze_halo_sigma)))
+    halo = np.clip(halo, 0, 1).astype(np.float32)
+    haze_soft = np.clip(low_contrast * blur_prior, 0, 1)
+    dust_haze_map = np.clip(
+        haze_soft * (0.35 + 0.65 * halo) * (0.50 + 0.50 * dust_blob) * (0.65 + 0.35 * anti_line) * not_overexp,
+        0, 1
+    ).astype(np.float32)
+
     hair_map = np.clip(temporal_static * hair_shape * mid * not_overexp, 0, 1)
 
     dust_unit, dust_heat = multi.aggregate_map_to_units(dust_map, unit_w, unit_h)
+    dust_haze_unit, dust_haze_heat = multi.aggregate_map_to_units(dust_haze_map, unit_w, unit_h)
     hair_unit, hair_heat = multi.aggregate_map_to_units(hair_map, unit_w, unit_h)
     dust_score, _ = tile.adaptive_top_mean(dust_unit, True, percent=2.0, min_tiles=8)
+    dust_haze_score, _ = tile.adaptive_top_mean(dust_haze_unit, True, percent=2.0, min_tiles=8)
     hair_score, _ = tile.adaptive_top_mean(hair_unit, True, percent=3.0, min_tiles=12)
 
     return {
         'noise_score': float(noise['noise_score']),
         'black_occlusion_score': float(black['black_occlusion_score']),
         'dust_score': 100.0 * float(dust_score),
+        'dust_haze_score': 100.0 * float(dust_haze_score),
         'hair_score': 100.0 * float(hair_score),
         'temporal_static_mean': float(temporal_static[~overexp_mask].mean()) if np.any(~overexp_mask) else 0.0,
         'overexp_excluded_ratio': float(overexp_mask.mean()),
@@ -212,6 +233,8 @@ def calculate_handcrafted_metrics(frames, args):
         'dust_low_contrast_response': float(low_contrast.mean()),
         'dust_blur_response': float(blur_prior.mean()),
         'dust_contour_response': float(dust_contour.mean()),
+        'dust_haze_response': float(dust_haze_map.mean()),
+        'dust_haze_halo_response': float(halo.mean()),
         'hair_line_response': float(hair_line.mean()),
         'hair_coherence_response': float(coherence.mean()),
         'hair_contour_response': float(hair_contour.mean()),
@@ -225,6 +248,7 @@ def calculate_handcrafted_metrics(frames, args):
         'temporal_static_heat': temporal_static,
         'overexp_heat': overexp_mask.astype(np.float32),
         'dust_heat': dust_heat,
+        'dust_haze_heat': dust_haze_heat,
         'hair_heat': hair_heat,
         'dust_blob_heat': dust_blob,
         'hair_line_heat': hair_line,
@@ -236,6 +260,7 @@ def make_prior_judgment(result, args):
         ('noise_score', 'noise', float(args.prior_noise_threshold)),
         ('black_occlusion_score', 'occ', float(args.prior_occlusion_threshold)),
         ('dust_score', 'dust', float(args.prior_dust_threshold)),
+        ('dust_haze_score', 'haze', float(args.prior_dust_haze_threshold)),
         ('hair_score', 'hair', float(args.prior_hair_threshold)),
     ]
     hits = []
@@ -260,15 +285,18 @@ def make_prior_judgment(result, args):
 def make_visual_judgment_lines(result, args):
     pred, hits, vals, top_text = make_prior_judgment(result, args)
     hit_text = ','.join(h.split(':', 1)[0] for h in hits) if hits else 'none'
+    seq_text = f'seq: mode={args.sequence_mode} win={args.window} sample_count={args.sample_count}'
     return [
         f'prior_judge={pred} hits={hit_text} {top_text}',
         'scores: ' + ' '.join(f'{k}={format_float(v)}' for k, v in vals.items()),
-        'thr: n>{} o>{} d>{} h>{}'.format(
+        'thr: n>{} o>{} d>{} haze>{} h>{}'.format(
             format_float(args.prior_noise_threshold),
             format_float(args.prior_occlusion_threshold),
             format_float(args.prior_dust_threshold),
+            format_float(args.prior_dust_haze_threshold),
             format_float(args.prior_hair_threshold),
         ),
+        seq_text,
     ]
 
 
@@ -281,6 +309,7 @@ def save_visualization(img_path, seed_img, result, out_dir, index, scene, args, 
         tile.colorize_01(result['temporal_static_heat']),
         tile.colorize_01(result['overexp_heat']),
         tile.overlay(base, result['dust_heat'], alpha),
+        tile.overlay(base, result['dust_haze_heat'], alpha),
         tile.overlay(base, result['hair_heat'], alpha),
         tile.colorize_01(np.maximum(result['dust_blob_heat'], result['hair_line_heat'])),
     ]
@@ -292,6 +321,7 @@ def save_visualization(img_path, seed_img, result, out_dir, index, scene, args, 
         f'temporal_static={format_float(result["temporal_static_mean"])}',
         f'overexp_excluded={format_float(result["overexp_excluded_ratio"])}',
         f'dust={format_float(result["dust_score"])}',
+        f'haze={format_float(result["dust_haze_score"])}',
         f'hair={format_float(result["hair_score"])}',
         'shape clues: dust_blob OR hair_line',
     ]
@@ -318,6 +348,7 @@ def best_threshold_summary_msgs(samples, args):
         ('noise_score', 'noise', multi.split_aliases(args.noise_positive_scenes)),
         ('black_occlusion_score', 'black_occlusion', multi.split_aliases(args.black_positive_scenes)),
         ('dust_score', 'dust', multi.split_aliases(args.dust_positive_scenes)),
+        ('dust_haze_score', 'dust_haze', multi.split_aliases(args.dust_positive_scenes)),
         ('hair_score', 'hair', multi.split_aliases(args.hair_positive_scenes)),
     ]
     msgs = ['Best independent classification thresholds for each abnormal branch:']
@@ -361,6 +392,8 @@ def main():
     parser.add_argument('--unit_height', type=int, default=3)
     parser.add_argument('--top_unit_percent', type=float, default=1.0)
     parser.add_argument('--noise_blur_ksize', type=int, default=5)
+    parser.add_argument('--noise_dark_weight', type=float, default=1.0, help='stronger low-light prior for noise; max dark amplification ~=2.0 by default.')
+    parser.add_argument('--noise_dark_scale', type=float, default=60.0)
     parser.add_argument('--temporal_reduce', default='max', choices=['max', 'p75', 'median', 'mean'])
     parser.add_argument('--stable_variation_scale', type=float, default=3.0)
     parser.add_argument('--black_luma_scale', type=float, default=35.0)
@@ -384,6 +417,10 @@ def main():
     # Handcrafted dust/hair knobs.
     parser.add_argument('--local_window', type=int, default=21)
     parser.add_argument('--dust_bright_weight', type=float, default=0.6)
+    parser.add_argument('--haze_bright_threshold', type=float, default=185.0)
+    parser.add_argument('--haze_bright_percentile', type=float, default=90.0)
+    parser.add_argument('--haze_halo_ksize', type=int, default=61)
+    parser.add_argument('--haze_halo_sigma', type=float, default=21.0)
     parser.add_argument('--hair_line_length', type=int, default=31)
     parser.add_argument('--hair_line_width', type=int, default=3)
     parser.add_argument('--semitransparent_luma_sigma', type=float, default=70.0)
@@ -392,7 +429,8 @@ def main():
     # Final abnormal decision: noise OR occlusion OR dust OR hair score exceeds its threshold.
     parser.add_argument('--prior_noise_threshold', type=float, default=69.0000)
     parser.add_argument('--prior_occlusion_threshold', type=float, default=70.0000)
-    parser.add_argument('--prior_dust_threshold', type=float, default=0.1500)
+    parser.add_argument('--prior_dust_threshold', type=float, default=2.6000)
+    parser.add_argument('--prior_dust_haze_threshold', type=float, default=25.0000)
     parser.add_argument('--prior_hair_threshold', type=float, default=1.7170)
 
     parser.add_argument('--normal_scene', default='normal')
@@ -419,7 +457,7 @@ def main():
     vis_dir = None if args.no_vis else build_vis_save_dir(save_txt_path)
     txt_f = open(save_txt_path, 'w', encoding='utf-8')
     txt_f.write(f'metric_name: {args.metric_name}\nmetric_mode: NR\nscore_direction: larger_means_more_abnormal\n')
-    txt_f.write('method: independent handcrafted branches. noise/occlusion reuse previous stable branches; dust=temporal_static*soft_blob*low_contrast*blur*anti_line; hair=temporal_static*line*coherence*elongated_contour*semi_transparent. Long overexposure is excluded from dust/hair temporal prior. Prior abnormal decision uses adjusted fixed thresholds from 20260917_145119.lens_handcrafted_abnormal.txt: noise>69.0000 OR occlusion>70.0000 OR dust>0.1500 OR hair>1.7170. Noise/occlusion are raised to reduce false alarms; dust is lowered to reduce misses.\n')
+    txt_f.write('method: independent handcrafted branches. noise/occlusion reuse previous stable branches; dust=temporal_static*soft_blob*low_contrast*blur*anti_line; hair=temporal_static*line*coherence*elongated_contour*semi_transparent. Long overexposure is excluded from dust/hair temporal prior. Prior abnormal decision uses adjusted fixed thresholds: noise>69.0000 OR occlusion>70.0000 OR dust_blob>2.6000 OR dust_haze>25.0000 OR hair>1.7170. Dust blob threshold is raised to suppress normal false alarms; dust_haze is a separate experimental branch for veiling/semi-transparent dust. Noise branch uses stronger low-light prior: dark_amp=1+noise_dark_weight*exp(-luma/noise_dark_scale).\n')
     for k in vars(args):
         txt_f.write(f'{k}: {getattr(args, k)}\n')
     txt_f.write(f'seed_count: {len(paths)}\nloaded_image_count: {len(load_paths)}\nauto_shifted_seed_count: {len(seed_adjustments)}\nweak_seed_count: {len(weak_seeds)}\ninvalid_seed_count: {len(invalid_seeds)}\nvis_dir: {vis_dir}\ntime: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')
@@ -450,8 +488,8 @@ def main():
         txt_f.write('\t'.join(map(str, row)) + '\n')
         prefix = f'[{scene}] ' if scene else ''
         pbar.update(1)
-        pbar.set_description(f'{prefix}{args.metric_name}: dust={format_float(res["dust_score"])} hair={format_float(res["hair_score"])}')
-        pbar.write(f'{prefix}{os.path.basename(p)} noise={format_float(res["noise_score"])} occ={format_float(res["black_occlusion_score"])} dust={format_float(res["dust_score"])} hair={format_float(res["hair_score"])} Time={elapsed}s')
+        pbar.set_description(f'{prefix}{args.metric_name}: dust={format_float(res["dust_score"])} haze={format_float(res["dust_haze_score"])} hair={format_float(res["hair_score"])}')
+        pbar.write(f'{prefix}{os.path.basename(p)} noise={format_float(res["noise_score"])} occ={format_float(res["black_occlusion_score"])} dust={format_float(res["dust_score"])} haze={format_float(res["dust_haze_score"])} hair={format_float(res["hair_score"])} Time={elapsed}s')
     pbar.close()
 
     scene_msgs = ['Scene statistics by metric:']
